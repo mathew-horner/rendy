@@ -1,5 +1,6 @@
 #![feature(const_fn_floating_point_arithmetic)]
 
+mod camera;
 mod geo;
 mod io;
 mod renderer;
@@ -80,6 +81,18 @@ async fn main() {
                         state.texture_index = (state.texture_index + 1) % TEXTURES.len();
                         let index = state.texture_index;
                         state.renderer.set_texture(TEXTURES[index]);
+                    }
+                    VirtualKeyCode::A => {
+                        state.lock().unwrap().renderer.move_camera(cgmath::vec3(-1.0, 0.0, 0.0));
+                    }
+                    VirtualKeyCode::D => {
+                        state.lock().unwrap().renderer.move_camera(cgmath::vec3(1.0, 0.0, 0.0));
+                    }
+                    VirtualKeyCode::W => {
+                        state.lock().unwrap().renderer.move_camera(cgmath::vec3(0.0, 0.0, 1.0));
+                    }
+                    VirtualKeyCode::S => {
+                        state.lock().unwrap().renderer.move_camera(cgmath::vec3(0.0, 0.0, -1.0));
                     }
                     _ => {}
                 },
