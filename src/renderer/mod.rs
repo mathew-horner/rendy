@@ -1,6 +1,6 @@
 mod bind_group;
-mod pipeline;
 
+use std::io::Read;
 use std::path::Path;
 
 use wgpu::util::DeviceExt;
@@ -9,10 +9,11 @@ use wgpu::{
 };
 use winit::dpi::PhysicalSize;
 use winit::window::Window;
+use crate::camera::{Camera, CameraUniform};
 
 use self::bind_group::{create_bind_group_for_image_texture_at_path, CreateBindGroupArgs};
-use self::pipeline::{create_render_pipeline_for_shader_at_path, CreateRenderPipelineArgs};
 use crate::geo::Vertex;
+use crate::renderer::bind_group::create_bind_group_for_uniform_buffer;
 
 const VERTICES: &[Vertex] = &[
     Vertex::new([0.5, 0.5, 0.0], [1.0, 1.0]),
@@ -35,6 +36,10 @@ pub struct Renderer {
     indices: u32,
     diffuse_bind_group: BindGroup,
     background_color: wgpu::Color,
+    camera: Camera,
+    camera_buffer: Buffer,
+    camera_bind_group: BindGroup,
+    camera_uniform: CameraUniform,
 }
 
 impl Renderer {
@@ -79,7 +84,39 @@ impl Renderer {
 
         surface.configure(&device, &config);
 
-        let bind_group = create_bind_group_for_image_texture_at_path(
+        let background_color = wgpu::Color {
+            r: 0.1,
+            g: 0.2,
+            b: 0.3,
+            a: 1.0,
+        };
+
+        let camera = Camera {
+            // position the camera one unit up and 2 units back
+            // +z is out of the screen
+            eye: (0.0, 1.0, 2.0).into(),
+            // have it look at the origin
+            target: (0.0, 0.0, 0.0).into(),
+            // which way is "up"
+            up: cgmath::Vector3::unit_y(),
+            aspect: config.width as f32 / config.height as f32,
+            fovy: 45.0,
+            znear: 0.1,
+            zfar: 100.0,
+        };
+
+        let mut camera_uniform = CameraUniform::new();
+        camera_uniform.set_view_proj(&camera);
+
+        let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Uniform Buffer"),
+            contents: bytemuck::cast_slice(&[camera_uniform]),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let camera_bind_group = create_bind_group_for_uniform_buffer(&camera_buffer, CreateBindGroupArgs { device: &device, queue: &queue });
+
+        let texture_bind_group = create_bind_group_for_image_texture_at_path(
             texture_path,
             CreateBindGroupArgs {
                 device: &device,
@@ -87,14 +124,60 @@ impl Renderer {
             },
         );
 
-        let pipeline = create_render_pipeline_for_shader_at_path(
-            shader_path,
-            CreateRenderPipelineArgs {
-                device: &device,
-                bind_group_layout: &bind_group.layout,
-                surface_config: &config,
-            },
-        );
+        let mut file = std::fs::File::open(shader_path).unwrap();
+        let mut buffer = String::new();
+        file.read_to_string(&mut buffer).unwrap();
+
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Shader Module"),
+            source: wgpu::ShaderSource::Wgsl(buffer.into()),
+        });
+
+        let pipeline_layout = device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Pipeline Layout"),
+                bind_group_layouts: &[&texture_bind_group.layout, &camera_bind_group.layout],
+                push_constant_ranges: &[],
+            });
+
+        let pipeline = device
+            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("Render Pipeline"),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: "vs_main",
+                    buffers: &[Vertex::layout()],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: "fs_main",
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: config.format,
+                        blend: Some(wgpu::BlendState::REPLACE),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList, // 1.
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw, // 2.
+                    cull_mode: Some(wgpu::Face::Back),
+                    // Setting this to anything other than Fill requires Features::NON_FILL_POLYGON_MODE
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    // Requires Features::DEPTH_CLIP_CONTROL
+                    unclipped_depth: false,
+                    // Requires Features::CONSERVATIVE_RASTERIZATION
+                    conservative: false,
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState {
+                    count: 1,
+                    mask: !0,
+                    alpha_to_coverage_enabled: false,
+                },
+                multiview: None,
+            });
 
         let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Vertex Buffer"),
@@ -108,13 +191,6 @@ impl Renderer {
             usage: wgpu::BufferUsages::INDEX,
         });
 
-        let background_color = wgpu::Color {
-            r: 0.1,
-            g: 0.2,
-            b: 0.3,
-            a: 1.0,
-        };
-
         Self {
             surface,
             device,
@@ -125,8 +201,12 @@ impl Renderer {
             vertex_buffer,
             index_buffer,
             indices: INDICES.len() as u32,
-            diffuse_bind_group: bind_group.actual,
+            diffuse_bind_group: texture_bind_group.actual,
             background_color,
+            camera,
+            camera_buffer,
+            camera_bind_group: camera_bind_group.actual,
+            camera_uniform,
         }
     }
 
@@ -159,6 +239,13 @@ impl Renderer {
         self.surface.configure(&self.device, &self.config);
     }
 
+    pub fn move_camera(&mut self, vector: cgmath::Vector3<f32>) {
+        self.camera.eye.x += 1.0;
+        // self.camera.eye += vector;
+        self.camera_uniform.set_view_proj(&self.camera);
+        self.queue.write_buffer(&self.camera_buffer, 0, bytemuck::cast_slice(&[self.camera_uniform]));
+    }
+
     pub fn draw(&self) -> Result<(), wgpu::SurfaceError> {
         let output = self.surface.get_current_texture()?;
         let view = output
@@ -187,6 +274,7 @@ impl Renderer {
 
             render_pass.set_pipeline(&self.pipeline);
             render_pass.set_bind_group(0, &self.diffuse_bind_group, &[]);
+            render_pass.set_bind_group(1, &self.camera_bind_group, &[]);
             render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
             render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
             render_pass.draw_indexed(0..self.indices, 0, 0..1);
