@@ -141,10 +141,6 @@ impl Renderer {
         .actual;
     }
 
-    pub fn set_background_color(&mut self, color: wgpu::Color) {
-        self.background_color = color;
-    }
-
     pub fn size(&self) -> PhysicalSize<u32> {
         self.size
     }
